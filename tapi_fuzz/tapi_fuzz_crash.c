@@ -43,6 +43,13 @@ crash_is_artifact(const char *path)
     if (strncmp(name, "README", 6) == 0)
         return false;
 
+    /*
+     * libFuzzer's -report_slow_units writes inputs that were merely
+     * slow: not a defect, and replaying them proves nothing.
+     */
+    if (strncmp(name, "slow-unit-", strlen("slow-unit-")) == 0)
+        return false;
+
     /* AFL++ keeps its own bookkeeping next to the crashes. */
     if (strcmp(name, ".state") == 0 || strcmp(name, "fuzzer_stats") == 0 ||
         strcmp(name, "fuzz_bitmap") == 0 || strcmp(name, "plot_data") == 0 ||
@@ -114,10 +121,46 @@ tapi_fuzz_list_dir(tapi_job_factory_t *factory, const char *dir,
     return 0;
 }
 
+/**
+ * The libFuzzer limits a replay runs under.
+ *
+ * The campaign's own limits, so that an input libFuzzer saved as a
+ * timeout or an out-of-memory is reported as one again. Without
+ * @c -timeout, libFuzzer waits 1200 s by default and a timeout input
+ * would outlive the replay; so when the campaign set none, or one the
+ * replay would not live through, half the replay budget is used,
+ * leaving libFuzzer the time to say what happened.
+ */
+static void
+crash_replay_limits(const tapi_fuzz_opt *opt, int timeout_ms, te_vec *args)
+{
+    unsigned int timeout_s = opt->timeout_s;
+
+    if (timeout_ms > 0 &&
+        (timeout_s == 0 || (uint64_t)timeout_s * 1000 >= (uint64_t)timeout_ms))
+        timeout_s = (unsigned int)MAX(1, timeout_ms / 2000);
+
+    if (timeout_s != 0)
+    {
+        te_string arg = TE_STRING_INIT;
+
+        te_string_append(&arg, "-timeout=%u", timeout_s);
+        TE_VEC_APPEND(args, arg.ptr);
+    }
+
+    if (opt->rss_limit_mb != 0)
+    {
+        te_string arg = TE_STRING_INIT;
+
+        te_string_append(&arg, "-rss_limit_mb=%u", opt->rss_limit_mb);
+        TE_VEC_APPEND(args, arg.ptr);
+    }
+}
+
 /** Build the command that replays one artifact. */
 static void
 crash_replay_args(const tapi_fuzz_opt *opt, const char *artifact,
-                  const char **program, te_vec *args)
+                  int timeout_ms, const char **program, te_vec *args)
 {
     if (opt->kind == TAPI_FUZZ_CARGO)
     {
@@ -126,15 +169,51 @@ crash_replay_args(const tapi_fuzz_opt *opt, const char *artifact,
         TE_VEC_APPEND_RVALUE(args, char *, TE_STRDUP("run"));
         TE_VEC_APPEND_RVALUE(args, char *, TE_STRDUP(opt->target));
         TE_VEC_APPEND_RVALUE(args, char *, TE_STRDUP(artifact));
+        /* Everything after -- goes to libFuzzer inside. */
+        TE_VEC_APPEND_RVALUE(args, char *, TE_STRDUP("--"));
+        crash_replay_limits(opt, timeout_ms, args);
         return;
     }
+
+    *program = opt->target;
+
+    /* libFuzzer takes its options before the inputs. */
+    if (opt->kind == TAPI_FUZZ_LIBFUZZER)
+        crash_replay_limits(opt, timeout_ms, args);
 
     /*
      * Everything else takes the input as a file argument, which is how
      * the fuzzers were told to run it in the first place.
      */
-    *program = opt->target;
     TE_VEC_APPEND_RVALUE(args, char *, TE_STRDUP(artifact));
+}
+
+/**
+ * What libFuzzer saved an artifact as, from the prefix of its name
+ * (@c crash-, @c timeout-, @c oom-, @c leak-), or @c NULL.
+ */
+static const char *
+crash_saved_as(const char *artifact)
+{
+    static const struct {
+        const char *prefix;
+        const char *what;
+    } kinds[] = {
+        { "crash-",   "a crash" },
+        { "timeout-", "a timeout" },
+        { "oom-",     "an out-of-memory" },
+        { "leak-",    "a leak" },
+    };
+    const char *name = crash_basename(artifact);
+    size_t i;
+
+    for (i = 0; i < TE_ARRAY_LEN(kinds); i++)
+    {
+        if (strncmp(name, kinds[i].prefix, strlen(kinds[i].prefix)) == 0)
+            return kinds[i].what;
+    }
+
+    return NULL;
 }
 
 /** Replay one artifact and read what the target said about it. */
@@ -149,7 +228,7 @@ crash_replay(tapi_job_factory_t *factory, const tapi_fuzz_opt *opt,
     const char *program = NULL;
     te_errno rc;
 
-    crash_replay_args(opt, artifact, &program, &args);
+    crash_replay_args(opt, artifact, timeout_ms, &program, &args);
 
     rc = tapi_fuzz_cmd(factory, "replay", program, &args, timeout_ms, &run);
     te_vec_deep_free(&args);
@@ -182,8 +261,22 @@ crash_replay(tapi_job_factory_t *factory, const tapi_fuzz_opt *opt,
 
     /*
      * Nothing recognisable: the artifact is still the identity of the
-     * input, and a fuzzer names it after its contents.
+     * input, and a fuzzer names it after its contents. Say how the
+     * replay ended and what the fuzzer took the input for, so that a
+     * crash that does not reproduce still says what it was.
      */
+    if (report->kind == TAPI_SANITIZER_NONE && report->error == NULL)
+    {
+        const char *saved_as = crash_saved_as(artifact);
+        te_string text = TE_STRING_INIT;
+
+        te_string_append(&text, "nothing recognisable on replay (%s %d)",
+                         output.status.type == TAPI_JOB_STATUS_SIGNALED ?
+                             "signal" : "exit status", output.status.value);
+        if (saved_as != NULL)
+            te_string_append(&text, "; libFuzzer saved it as %s", saved_as);
+        report->error = text.ptr;
+    }
     tapi_sanitizer_signature_fallback(report, crash_basename(artifact));
 
     tapi_devtool_run_fini(&run);

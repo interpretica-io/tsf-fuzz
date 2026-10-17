@@ -25,6 +25,9 @@
 /** How many frames go into a signature. */
 #define SAN_SIGNATURE_FRAMES    3
 
+/** The function every libFuzzer, AFL++ and honggfuzz harness exports. */
+#define SAN_FUZZ_ENTRY          "LLVMFuzzerTestOneInput"
+
 /** Frames that belong to the runtime rather than to the defect. */
 static const char *const san_noise_prefixes[] = {
     "__asan",
@@ -35,6 +38,8 @@ static const char *const san_noise_prefixes[] = {
     "__sanitizer",
     "__interceptor",
     "asan_",
+    /* libFuzzer's driver and its signal, alarm and exit callbacks. */
+    "fuzzer::",
     NULL,
 };
 
@@ -48,6 +53,24 @@ static const char *const san_noise_names[] = {
     "operator new[]",
     "operator delete",
     "operator delete[]",
+    /*
+     * The C library raising a signal or leaving the process: the
+     * defect is in whoever called them, and their names vary with the
+     * libc version.
+     */
+    "abort",
+    "raise",
+    "gsignal",
+    "__GI_abort",
+    "__GI_raise",
+    "pthread_kill",
+    "__pthread_kill",
+    "__pthread_kill_internal",
+    "__pthread_kill_implementation",
+    "__restore_rt",
+    "exit",
+    "_exit",
+    "__run_exit_handlers",
     NULL,
 };
 
@@ -240,6 +263,8 @@ san_parse_header(const char *line, tapi_sanitizer_report *report)
         { "MemorySanitizer: ",           TAPI_SANITIZER_MSAN },
         { "ThreadSanitizer: ",           TAPI_SANITIZER_TSAN },
         { "UndefinedBehaviorSanitizer: ", TAPI_SANITIZER_UBSAN },
+        /* Only the error line: libFuzzer also says "INFO: ..." a lot. */
+        { "ERROR: libFuzzer: ",          TAPI_SANITIZER_LIBFUZZER },
     };
     size_t i;
 
@@ -258,12 +283,21 @@ san_parse_header(const char *line, tapi_sanitizer_report *report)
         report->kind = markers[i].kind;
         report->error = san_dup_until(found, "(\n");
 
-        /* "heap-use-after-free on address 0x..." - the address varies. */
+        /*
+         * "heap-use-after-free on address 0x..." - the address varies,
+         * and so does libFuzzer's "timeout after 3 seconds".
+         */
         {
-            char *on = strstr(report->error, " on ");
+            static const char *const cuts[] = { " on ", " after " };
+            size_t j;
 
-            if (on != NULL)
-                *on = '\0';
+            for (j = 0; j < TE_ARRAY_LEN(cuts); j++)
+            {
+                char *cut = strstr(report->error, cuts[j]);
+
+                if (cut != NULL)
+                    *cut = '\0';
+            }
         }
         san_strip_trailing_space(report->error);
 
@@ -331,6 +365,13 @@ san_build_signature(tapi_sanitizer_report *report)
 
         te_string_append(&signature, ":%s", report->frames[i].function);
         used++;
+
+        /*
+         * Below the fuzzing entry point is the fuzzer's driver, the same
+         * for every defect: its main() says nothing about this one.
+         */
+        if (strcmp(report->frames[i].function, SAN_FUZZ_ENTRY) == 0)
+            break;
     }
 
     report->signature = signature.ptr;
@@ -467,6 +508,8 @@ tapi_sanitizer_kind2str(tapi_sanitizer_kind kind)
             return "panic";
         case TAPI_SANITIZER_SIGNAL:
             return "signal";
+        case TAPI_SANITIZER_LIBFUZZER:
+            return "libfuzzer";
         default:
             return "unknown";
     }
@@ -495,6 +538,12 @@ tapi_sanitizer_severity(tapi_sanitizer_kind kind, const char *error)
         case TAPI_SANITIZER_UBSAN:
         case TAPI_SANITIZER_RUST_PANIC:
             /* Reachable from input, it is at least a denial of service. */
+            return TAPI_CYBERSEC_SEV_MEDIUM;
+
+        case TAPI_SANITIZER_LIBFUZZER:
+            /* A signal is a crash; the rest is a denial of service. */
+            if (error != NULL && strcmp(error, "deadly signal") == 0)
+                return TAPI_CYBERSEC_SEV_HIGH;
             return TAPI_CYBERSEC_SEV_MEDIUM;
 
         case TAPI_SANITIZER_LSAN:

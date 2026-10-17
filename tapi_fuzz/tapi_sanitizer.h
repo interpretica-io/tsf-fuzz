@@ -20,6 +20,14 @@
  * A Rust panic is parsed too. It is the same kind of evidence, it comes
  * out of the same fuzzing run, and a test should not have to care which
  * language produced the crash it is looking at.
+ *
+ * So is what libFuzzer reports on its own behalf. A target that dies on
+ * a signal no sanitizer handles (an @c abort() with ASan's default
+ * @c handle_abort=0, or any signal in a target built without
+ * sanitizers), runs past @c -timeout, grows past @c -rss_limit_mb or
+ * @c -malloc_limit_mb, or calls @c exit() is caught by libFuzzer, which
+ * prints @c "ERROR: libFuzzer: <what>" and a stack, and exits with an
+ * error code instead of a signal.
  */
 
 #ifndef __TSF_TAPI_SANITIZER_H__
@@ -53,6 +61,11 @@ typedef enum tapi_sanitizer_kind {
     TAPI_SANITIZER_RUST_PANIC,
     /** The process died on a signal and said nothing. */
     TAPI_SANITIZER_SIGNAL,
+    /**
+     * libFuzzer itself: @c "deadly signal", @c "timeout",
+     * @c "out-of-memory", @c "fuzz target exited" and the like.
+     */
+    TAPI_SANITIZER_LIBFUZZER,
 } tapi_sanitizer_kind;
 
 /** One frame of a reported stack. */
@@ -136,7 +149,9 @@ extern const char *tapi_sanitizer_kind2str(tapi_sanitizer_kind kind);
  * How much a defect of this kind matters.
  *
  * Memory corruption is worse than a leak, and a leak is worse than a
- * panic that the program was entitled to.
+ * panic that the program was entitled to. A deadly signal libFuzzer
+ * caught counts as a crash; a timeout, running out of memory or an
+ * @c exit() from the target are a denial of service.
  *
  * @param kind          Kind.
  * @param error         The error text (may be @c NULL).

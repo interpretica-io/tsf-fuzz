@@ -441,6 +441,34 @@ fuzz_read_after(const char *line, const char *key, uint64_t *value)
     return true;
 }
 
+/**
+ * Count an artifact libFuzzer reports having written.
+ *
+ * The line is @c "Test unit written to <prefix>crash-<sha1>"; the
+ * prefix of the file name says what the input did.
+ */
+static void
+fuzz_count_artifact(const char *line, tapi_fuzz_stats *stats)
+{
+    static const char *const marker = "Test unit written to ";
+    const char *path = strstr(line, marker);
+    const char *name;
+
+    if (path == NULL)
+        return;
+
+    path += strlen(marker);
+    name = strrchr(path, '/');
+    name = (name != NULL) ? name + 1 : path;
+
+    if (strncmp(name, "timeout-", strlen("timeout-")) == 0)
+        stats->timeouts++;
+    else if (strncmp(name, "crash-", strlen("crash-")) == 0 ||
+             strncmp(name, "oom-", strlen("oom-")) == 0 ||
+             strncmp(name, "leak-", strlen("leak-")) == 0)
+        stats->crashes++;
+}
+
 /** Read the statistics libFuzzer prints on every interesting input. */
 static bool
 fuzz_stats_libfuzzer(const char *text, tapi_fuzz_stats *stats)
@@ -455,6 +483,8 @@ fuzz_stats_libfuzzer(const char *text, tapi_fuzz_stats *stats)
          line = strtok_r(NULL, "\n", &saveptr))
     {
         uint64_t value;
+
+        fuzz_count_artifact(line, stats);
 
         /* Keep the last one: it is the state the campaign ended in. */
         if (line[0] != '#' || strstr(line, "exec/s:") == NULL)

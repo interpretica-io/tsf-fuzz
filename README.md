@@ -133,6 +133,27 @@ Rust panics are parsed alongside the C sanitizers. They come out of the
 same campaign and a test should not have to care which language produced
 the crash it is looking at.
 
+So are the errors libFuzzer reports itself. A signal no sanitizer
+handles — `abort()` under ASan's default `handle_abort=0`, or any signal
+in a target built without sanitizers — is caught by libFuzzer as a
+`deadly signal`; running past `-timeout` is a `timeout`, growing past
+`-rss_limit_mb` or `-malloc_limit_mb` an `out-of-memory`, and calling
+`exit()` a `fuzz target exited`. Each becomes a `libfuzzer:` signature
+with the frames of the target, not of libFuzzer's handlers, and stops at
+`LLVMFuzzerTestOneInput`. A deadly signal is reported as `high`, the
+others as `medium`.
+
+The replay runs under the campaign's `timeout_s` and `rss_limit_mb`, so
+an input saved as a timeout or an out-of-memory is reported as one
+again. When the campaign set no timeout, or one longer than the replay
+may take, the replay gives libFuzzer half of its own budget, so that a
+hanging input is reported rather than killed. An artifact that reproduces nothing keeps the artifact name as
+its signature and says how the replay ended and what libFuzzer saved it
+as (`crash-`, `timeout-`, `oom-`, `leak-`). `slow-unit-` files are not
+defects and are not replayed. The campaign statistics count the
+artifacts libFuzzer reports having written: `timeout-` as timeouts, the
+rest as crashes.
+
 ## Running a campaign as a test
 
 A campaign is not a unit test: it takes as long as it is told to. Give
